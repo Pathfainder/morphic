@@ -1,55 +1,61 @@
 import { createStreamableUI, createStreamableValue } from 'ai/rsc'
-import {
-  CoreMessage,
-  ToolCallPart,
-  ToolResultPart,
-  streamText as nonexperimental_streamText
-} from 'ai'
-import { Section } from '@/components/section'
-import { OpenAI } from '@ai-sdk/openai'
-import { BotMessage } from '@/components/message'
+import { CoreMessage, ToolCallPart, ToolResultPart, streamText } from 'ai'
 import { getTools } from './tools'
+import { getModel, transformToolMessages } from '../utils'
+import { AnswerSection } from '@/components/answer-section'
 
 export async function researcher(
   uiStream: ReturnType<typeof createStreamableUI>,
-  streamText: ReturnType<typeof createStreamableValue<string>>,
+  streamableText: ReturnType<typeof createStreamableValue<string>>,
   messages: CoreMessage[],
   useSpecificModel?: boolean
 ) {
-  const openai = new OpenAI({
-    baseUrl: process.env.OPENAI_API_BASE, // optional base URL for proxies etc.
-    apiKey: process.env.OPENAI_API_KEY, // optional API key, default to env property OPENAI_API_KEY
-    organization: '' // optional organization
-  })
-
   let fullResponse = ''
   let hasError = false
-  const answerSection = (
-    <Section title="Answer">
-      <BotMessage content={streamText.value} />
-    </Section>
-  )
 
-  let isFirstToolResponse = true
-  const currentDate = new Date().toLocaleString();
-  const result = await nonexperimental_streamText({
-    model: openai.chat(process.env.OPENAI_API_MODEL || 'gpt-4o'),
+  // Transform the messages if using Ollama provider
+  let processedMessages = messages
+  const useOllamaProvider = !!(
+    process.env.OLLAMA_MODEL && process.env.OLLAMA_BASE_URL
+  )
+  if (useOllamaProvider) {
+    processedMessages = transformToolMessages(messages)
+  }
+  const includeToolResponses = messages.some(message => message.role === 'tool')
+  const useSubModel = useOllamaProvider && includeToolResponses
+
+  const answerSection = <AnswerSection result={streamableText.value} />
+  const currentDate = new Date().toLocaleString()
+  const result = await streamText({
+    model: getModel(useSubModel),
     maxTokens: 2500,
     system: `As a professional search expert, you possess the ability to search for any information on the web.
     or any information on the web.
     For each user query, utilize the search results to their fullest potential to provide additional information and assistance in your response.
     If there are any images relevant to your answer, be sure to include them as well.
     Aim to directly address the user's question, augmenting your response with insights gleaned from the search results.
-    Whenever quoting or referencing information from a specific URL, always cite the source URL explicitly.
+    Whenever quoting or referencing information from a specific URL, always explicitly cite the source URL using the [[number]](url) format. Multiple citations can be included as needed, e.g., [[number]](url), [[number]](url).
+    The retrieve tool can only be used with URLs provided by the user. URLs from search results cannot be used.
+    If it is a domain or a site name instead of a URL, specify it in the include_domains of the search tool.
     Please match the language of the response to the user's language. Current date and time: ${currentDate}`,
-    messages,
+    messages: processedMessages,
     tools: getTools({
       uiStream,
-      fullResponse,
-      hasError,
-      isFirstToolResponse
+      fullResponse
     })
+  }).catch(err => {
+    hasError = true
+    fullResponse = 'Error: ' + err.message
+    streamableText.update(fullResponse)
   })
+
+  // If the result is not available, return an error response
+  if (!result) {
+    return { result, fullResponse, hasError, toolResponses: [] }
+  }
+
+  // Remove the spinner
+  uiStream.update(null)
 
   // Process the response
   const toolCalls: ToolCallPart[] = []
@@ -65,7 +71,7 @@ export async function researcher(
           }
 
           fullResponse += delta.textDelta
-          streamText.update(fullResponse)
+          streamableText.update(fullResponse)
         }
         break
       case 'tool-call':
@@ -73,12 +79,16 @@ export async function researcher(
         break
       case 'tool-result':
         // Append the answer section if the specific model is not used
-        if (!useSpecificModel && toolResponses.length === 0) {
+        if (!useSpecificModel && toolResponses.length === 0 && delta.result) {
           uiStream.append(answerSection)
+        }
+        if (!delta.result) {
+          hasError = true
         }
         toolResponses.push(delta)
         break
       case 'error':
+        console.log('Error: ' + delta.error)
         hasError = true
         fullResponse += `\nError occurred while executing the tool`
         break
